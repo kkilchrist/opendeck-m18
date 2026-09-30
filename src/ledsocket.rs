@@ -8,7 +8,9 @@
 //! {"colors": ["#rrggbb", ... 24]}           replace the whole palette
 //! {"set": {"0": "#ff0000", "23": "#000"}}    change individual LEDs
 //! {"restore": true}                          back to the Set LED Colors key's palette
-//! {"get": true}                              reply with the live palette
+//! {"get": true}                              reply with the live palette, brightness, standby
+//! {"brightness": 30}                         hardware LED brightness, 0-100 (kept across reconnects)
+//! {"standby": true}                          screen + LEDs dark; false (or any key press) wakes
 //! ```
 //!
 //! Every request may carry `"device": "<id>"`; without it, every connected M18 is
@@ -31,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     SESSIONS,
-    device::DeviceCommand,
+    device::{ASLEEP, DeviceCommand, LED_LEVEL},
     palette::{self, LED_COUNT, LedPalette},
 };
 
@@ -96,6 +98,12 @@ async fn handle(stream: UnixStream) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Control {
+    Brightness(u8),
+    Standby(bool),
+}
+
 async fn apply(request: &Value) -> Result<Value, String> {
     let devices: Vec<String> = match request.get("device").and_then(Value::as_str) {
         Some(id) => vec![id.to_owned()],
@@ -111,7 +119,35 @@ async fn apply(request: &Value) -> Result<Value, String> {
             .iter()
             .filter_map(|id| live.get(id).map(|p| (id.clone(), palette::action_settings(p)["ledColors"].clone())))
             .collect();
-        return Ok(json!({ "ok": true, "palettes": palettes }));
+        let level = LED_LEVEL.load(std::sync::atomic::Ordering::Acquire);
+        let asleep: Vec<String> = ASLEEP.lock().unwrap().iter().cloned().collect();
+        return Ok(json!({ "ok": true, "palettes": palettes, "brightness": (level <= 100).then_some(level), "asleep": asleep }));
+    }
+
+    // Brightness and standby go straight to each device's output worker.
+    let control = if let Some(level) = request.get("brightness") {
+        let level = level.as_u64().filter(|l| *l <= 100).ok_or("brightness must be 0-100")? as u8;
+        LED_LEVEL.store(level, std::sync::atomic::Ordering::Release);
+        Some(Control::Brightness(level))
+    } else {
+        request.get("standby").and_then(Value::as_bool).map(Control::Standby)
+    };
+    if let Some(control) = control {
+        for id in &devices {
+            let output = SESSIONS.read().await.output(id).cloned();
+            let Some(output) = output else {
+                return Err(format!("unknown device {id}"));
+            };
+            let command = match control {
+                Control::Brightness(level) => DeviceCommand::SetLedBrightness(level),
+                Control::Standby(sleep) => DeviceCommand::Standby(sleep),
+            };
+            if output.send(command).await.is_err() {
+                output.token.cancel();
+                return Err(format!("device {id} is unavailable"));
+            }
+        }
+        return Ok(json!({ "ok": true, "devices": devices }));
     }
 
     let mut applied = Vec::new();

@@ -27,7 +27,24 @@ pub enum DeviceCommand {
     ClearAll,
     SetBrightness(u8),
     SetLedColors(LedPalette),
+    /// Hardware LED strip brightness, 0-100 (fork addition).
+    SetLedBrightness(u8),
+    /// Screen and LEDs dark, or back on (fork addition). While asleep, the
+    /// latest screen brightness and palette are held and applied on wake.
+    Standby(bool),
 }
+
+/// Devices currently in standby, so the input side can wake on a key press.
+pub static ASLEEP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Key releases to drop because their press woke the deck from standby.
+static SWALLOWED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, u8)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// LED strip brightness chosen over the LED socket; re-applied on reconnect.
+/// 255 = never set, leave the device default.
+pub static LED_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 
 pub struct DeviceOutput {
     pub id: String,
@@ -451,6 +468,25 @@ async fn process_session_report<S: KeyEventSink>(
     };
 
     log::debug!("New update: {:#?}", event);
+
+    // Fork addition: a press while in standby only wakes the deck. Its
+    // release is swallowed too, so OpenDeck never sees half a press.
+    match event {
+        ButtonEvent::Down(key) if ASLEEP.lock().unwrap().remove(id) => {
+            SWALLOWED.lock().unwrap().insert((id.to_owned(), key));
+            drop(input_guard);
+            let output = SESSIONS.read().await.output(id).cloned();
+            if let Some(output) = output {
+                let _ = output.send(DeviceCommand::Standby(false)).await;
+            }
+            return Ok(ReportStatus::Current);
+        }
+        ButtonEvent::Up(key) if SWALLOWED.lock().unwrap().remove(&(id.to_owned(), key)) => {
+            return Ok(ReportStatus::Current);
+        }
+        _ => {}
+    }
+
     let result = sink.emit(id, event).await;
     drop(input_guard);
 
@@ -488,6 +524,7 @@ trait OutputDevice: Send + Sync {
     async fn clear_all_button_images(&self) -> Result<(), MirajazzError>;
     async fn set_brightness(&self, brightness: u8) -> Result<(), MirajazzError>;
     async fn set_led_colors(&self, colors: &[[u8; 3]]) -> Result<(), MirajazzError>;
+    async fn set_led_brightness(&self, percent: u8) -> Result<(), MirajazzError>;
     async fn flush(&self) -> Result<(), MirajazzError>;
     async fn keep_alive(&self) -> Result<(), MirajazzError>;
 }
@@ -518,6 +555,10 @@ impl OutputDevice for Device {
         Device::set_led_colors(self, colors).await
     }
 
+    async fn set_led_brightness(&self, percent: u8) -> Result<(), MirajazzError> {
+        Device::set_led_brightness(self, percent).await
+    }
+
     async fn flush(&self) -> Result<(), MirajazzError> {
         Device::flush(self).await
     }
@@ -540,11 +581,24 @@ async fn device_output_task<D: OutputDevice + 'static>(
     let mut keepalive = interval(Duration::from_secs(10));
     // Restore before consuming queued updates, so a newer selection always wins.
     let saved = crate::palette::PALETTES.lock().await.get(&id);
+    // Standby bookkeeping: what to put back on wake, and what the LED
+    // brightness already is (the device re-renders on every LBLIG, wiping a
+    // colour frame sent just before, so never re-send an unchanged level).
+    let mut asleep = false;
+    let mut screen: u8 = 50;
+    let mut colors_now = saved;
+    let mut led_level_sent: Option<u8> = None;
+    ASLEEP.lock().unwrap().remove(&id);
     if let Some(colors) = saved {
         log::info!("Restoring LED palette for {}", id);
         device.set_led_colors(&colors).await?;
         #[cfg(unix)]
         crate::ledsocket::note_applied(&id, colors).await;
+    }
+    let level = LED_LEVEL.load(std::sync::atomic::Ordering::Acquire);
+    if level <= 100 {
+        device.set_led_brightness(level).await?;
+        led_level_sent = Some(level);
     }
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     keepalive.tick().await;
@@ -585,14 +639,56 @@ async fn device_output_task<D: OutputDevice + 'static>(
                     Err(err) => Err(err),
                 }
             }
-            OutputAction::Command(Some(DeviceCommand::SetBrightness(brightness))) => device
-                .set_brightness(brightness)
-                .await
-                .map(|_| OutputStep::Continue),
-            OutputAction::Command(Some(DeviceCommand::SetLedColors(colors))) => device
-                .set_led_colors(&colors)
-                .await
-                .map(|_| OutputStep::Continue),
+            OutputAction::Command(Some(DeviceCommand::SetBrightness(brightness))) => {
+                screen = brightness;
+                if asleep {
+                    Ok(OutputStep::Continue)
+                } else {
+                    device.set_brightness(brightness).await.map(|_| OutputStep::Continue)
+                }
+            }
+            OutputAction::Command(Some(DeviceCommand::SetLedColors(colors))) => {
+                colors_now = Some(colors);
+                if asleep {
+                    Ok(OutputStep::Continue)
+                } else {
+                    device.set_led_colors(&colors).await.map(|_| OutputStep::Continue)
+                }
+            }
+            OutputAction::Command(Some(DeviceCommand::SetLedBrightness(level))) => {
+                if led_level_sent == Some(level) {
+                    Ok(OutputStep::Continue)
+                } else {
+                    led_level_sent = Some(level);
+                    device.set_led_brightness(level).await.map(|_| OutputStep::Continue)
+                }
+            }
+            OutputAction::Command(Some(DeviceCommand::Standby(sleep))) if sleep == asleep => {
+                Ok(OutputStep::Continue)
+            }
+            OutputAction::Command(Some(DeviceCommand::Standby(sleep))) => {
+                asleep = sleep;
+                if sleep {
+                    ASLEEP.lock().unwrap().insert(id.clone());
+                    log::info!("Standby on for {}", id);
+                    // A black frame rather than LBLIG 0, so waking needs no
+                    // brightness write (which would wipe the restored colours).
+                    match device.set_led_colors(&[[0, 0, 0]; crate::palette::LED_COUNT]).await {
+                        Ok(()) => device.set_brightness(0).await.map(|_| OutputStep::Continue),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    ASLEEP.lock().unwrap().remove(&id);
+                    log::info!("Standby off for {}", id);
+                    match device.set_brightness(screen).await {
+                        Ok(()) => match colors_now {
+                            Some(colors) => device.set_led_colors(&colors).await.map(|_| OutputStep::Continue),
+                            None => Ok(OutputStep::Continue),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+            }
             OutputAction::Command(None) | OutputAction::Cancel => Ok(OutputStep::Stop),
             OutputAction::Flush => {
                 log::debug!("Flushing pending updates for {}", id);
