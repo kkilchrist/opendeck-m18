@@ -543,6 +543,8 @@ async fn device_output_task<D: OutputDevice + 'static>(
     if let Some(colors) = saved {
         log::info!("Restoring LED palette for {}", id);
         device.set_led_colors(&colors).await?;
+        #[cfg(unix)]
+        crate::ledsocket::note_applied(&id, colors).await;
     }
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     keepalive.tick().await;

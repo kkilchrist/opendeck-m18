@@ -138,6 +138,15 @@ impl<D, O> SessionRegistry<D, O> {
         }
     }
 
+    /// Ids of devices with a live output worker (fork addition, for the LED socket).
+    pub fn output_ids(&self) -> Vec<String> {
+        self.registrations
+            .keys()
+            .filter(|id| self.output(id).is_some())
+            .cloned()
+            .collect()
+    }
+
     pub fn output(&self, id: &str) -> Option<&O> {
         match &self.registrations.get(id)?.phase {
             SessionPhase::Registering {

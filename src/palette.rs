@@ -98,7 +98,7 @@ pub fn action_settings(palette: &LedPalette) -> SettingsValue {
     })
 }
 
-fn parse_color(color: &str) -> Option<[u8; 3]> {
+pub fn parse_color(color: &str) -> Option<[u8; 3]> {
     let hex = color.strip_prefix('#')?;
     if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;

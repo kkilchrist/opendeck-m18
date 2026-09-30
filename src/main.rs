@@ -18,6 +18,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 mod device;
 mod inputs;
+#[cfg(unix)]
+mod ledsocket;
 mod mappings;
 mod palette;
 mod session;
@@ -76,6 +78,16 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
             .await
             .insert_task("_watcher_task".to_string(), token);
 
+        #[cfg(unix)]
+        {
+            let token = Arc::new(CancellationToken::new());
+            tracker.spawn(ledsocket::serve(token.clone()));
+            SESSIONS
+                .write()
+                .await
+                .insert_task("_led_socket".to_string(), token);
+        }
+
         log::info!("Plugin initialized");
 
         Ok(())
@@ -88,6 +100,8 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
         let mut store = palette::PALETTES.lock().await;
         let pending = store.load(event.payload.settings);
         for (id, colors) in store.saved_palettes() {
+            #[cfg(unix)]
+            ledsocket::note_applied(id, *colors).await;
             let output = SESSIONS.read().await.output(id).cloned();
             if let Some(output) = output
                 && output
@@ -177,6 +191,8 @@ async fn apply_palette(instance: &Instance, settings: &serde_json::Value) {
 
     let mut store = palette::PALETTES.lock().await;
     store.select(&instance.device_id, palette);
+    #[cfg(unix)]
+    ledsocket::note_applied(&instance.device_id, palette).await;
     send_device_command(&instance.device_id, DeviceCommand::SetLedColors(palette)).await;
     if let Some(settings) = store.settings_to_save()
         && let Err(error) = set_global_settings(settings).await
