@@ -157,7 +157,7 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
 
         if let Some(output) = output {
             if output
-                .send(DeviceCommand::SetBrightness(event.brightness))
+                .send(DeviceCommand::SetBrightness(screen_level(event.brightness)))
                 .await
                 .is_err()
             {
@@ -169,6 +169,14 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
         }
 
         Ok(())
+    }
+}
+
+/// OpenDeck's brightness, unless the LED socket chose one (fork addition).
+fn screen_level(requested: u8) -> u8 {
+    match device::SCREEN_LEVEL.load(Ordering::Acquire) {
+        chosen if chosen <= 100 => chosen,
+        _ => requested,
     }
 }
 

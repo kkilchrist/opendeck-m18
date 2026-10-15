@@ -46,6 +46,11 @@ static SWALLOWED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet
 /// 255 = never set, leave the device default.
 pub static LED_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 
+/// Screen brightness chosen over the LED socket (fork addition). Once set it
+/// wins over OpenDeck's own brightness setting and is re-applied on reconnect.
+/// 255 = never set, OpenDeck decides.
+pub static SCREEN_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
 pub struct DeviceOutput {
     pub id: String,
     pub token: Arc<CancellationToken>,
@@ -586,6 +591,11 @@ async fn device_output_task<D: OutputDevice + 'static>(
     // colour frame sent just before, so never re-send an unchanged level).
     let mut asleep = false;
     let mut screen: u8 = 50;
+    let chosen = SCREEN_LEVEL.load(std::sync::atomic::Ordering::Acquire);
+    if chosen <= 100 {
+        screen = chosen;
+        device.set_brightness(chosen).await?;
+    }
     let mut colors_now = saved;
     let mut led_level_sent: Option<u8> = None;
     ASLEEP.lock().unwrap().remove(&id);

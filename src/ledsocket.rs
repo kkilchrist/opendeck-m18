@@ -11,11 +11,14 @@
 //! {"get": true}                              reply with the live palette, brightness, standby
 //! {"brightness": 30}                         hardware LED brightness, 0-100 (kept across reconnects)
 //! {"standby": true}                          screen + LEDs dark; false (or any key press) wakes
+//! {"screen": 50}                             screen brightness, 0-100; wins over OpenDeck's from then on
+//! {"colors": [...], "save": true}            any palette change, also kept as the saved palette
 //! ```
 //!
 //! Every request may carry `"device": "<id>"`; without it, every connected M18 is
 //! targeted. Live palettes are held in memory only. The saved palette stays
-//! whatever the Set LED Colors key last chose, so a restart comes back to it.
+//! whatever the Set LED Colors key (or a `save` request) last chose, so a
+//! restart and `restore` come back to it.
 //!
 //! Path: `$OPENDECK_M18_LED_SOCKET`, else `<temp dir>/opendeck-m18-leds.sock`.
 //! OpenDeck starts every plugin with the same environment, so another plugin
@@ -33,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     SESSIONS,
-    device::{ASLEEP, DeviceCommand, LED_LEVEL},
+    device::{ASLEEP, DeviceCommand, LED_LEVEL, SCREEN_LEVEL},
     palette::{self, LED_COUNT, LedPalette},
 };
 
@@ -101,6 +104,7 @@ async fn handle(stream: UnixStream) {
 #[derive(Clone, Copy)]
 enum Control {
     Brightness(u8),
+    Screen(u8),
     Standby(bool),
 }
 
@@ -121,7 +125,9 @@ async fn apply(request: &Value) -> Result<Value, String> {
             .collect();
         let level = LED_LEVEL.load(std::sync::atomic::Ordering::Acquire);
         let asleep: Vec<String> = ASLEEP.lock().unwrap().iter().cloned().collect();
-        return Ok(json!({ "ok": true, "palettes": palettes, "brightness": (level <= 100).then_some(level), "asleep": asleep }));
+        let screen = SCREEN_LEVEL.load(std::sync::atomic::Ordering::Acquire);
+        return Ok(json!({ "ok": true, "palettes": palettes, "brightness": (level <= 100).then_some(level),
+            "screen": (screen <= 100).then_some(screen), "asleep": asleep }));
     }
 
     // Brightness and standby go straight to each device's output worker.
@@ -129,6 +135,10 @@ async fn apply(request: &Value) -> Result<Value, String> {
         let level = level.as_u64().filter(|l| *l <= 100).ok_or("brightness must be 0-100")? as u8;
         LED_LEVEL.store(level, std::sync::atomic::Ordering::Release);
         Some(Control::Brightness(level))
+    } else if let Some(level) = request.get("screen") {
+        let level = level.as_u64().filter(|l| *l <= 100).ok_or("screen must be 0-100")? as u8;
+        SCREEN_LEVEL.store(level, std::sync::atomic::Ordering::Release);
+        Some(Control::Screen(level))
     } else {
         request.get("standby").and_then(Value::as_bool).map(Control::Standby)
     };
@@ -140,6 +150,7 @@ async fn apply(request: &Value) -> Result<Value, String> {
             };
             let command = match control {
                 Control::Brightness(level) => DeviceCommand::SetLedBrightness(level),
+                Control::Screen(level) => DeviceCommand::SetBrightness(level),
                 Control::Standby(sleep) => DeviceCommand::Standby(sleep),
             };
             if output.send(command).await.is_err() {
@@ -162,8 +173,18 @@ async fn apply(request: &Value) -> Result<Value, String> {
             return Err(format!("device {id} is unavailable"));
         }
         LIVE.lock().await.insert(id.clone(), next);
-        applied.push(id);
+        applied.push((id, next));
     }
+    if request.get("save").and_then(Value::as_bool) == Some(true) {
+        let mut store = palette::PALETTES.lock().await;
+        for (id, colors) in &applied {
+            store.select(id, *colors);
+        }
+        if let Some(settings) = store.settings_to_save() {
+            openaction::set_global_settings(settings).await.map_err(|error| format!("saving the palette failed: {error}"))?;
+        }
+    }
+    let applied: Vec<String> = applied.into_iter().map(|(id, _)| id).collect();
     Ok(json!({ "ok": true, "devices": applied }))
 }
 
