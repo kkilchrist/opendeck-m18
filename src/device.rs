@@ -650,16 +650,20 @@ async fn device_output_task<D: OutputDevice + 'static>(
                 }
             }
             OutputAction::Command(Some(DeviceCommand::SetBrightness(brightness))) => {
+                let was_dark = screen == 0;
                 screen = brightness;
                 if asleep {
                     Ok(OutputStep::Continue)
                 } else {
-                    device.set_brightness(brightness).await.map(|_| OutputStep::Continue)
+                    match device.set_brightness(brightness).await {
+                        Ok(()) => led_follow_screen(&*device, was_dark, brightness, colors_now).await,
+                        Err(error) => Err(error),
+                    }
                 }
             }
             OutputAction::Command(Some(DeviceCommand::SetLedColors(colors))) => {
                 colors_now = Some(colors);
-                if asleep {
+                if asleep || screen == 0 {
                     Ok(OutputStep::Continue)
                 } else {
                     device.set_led_colors(&colors).await.map(|_| OutputStep::Continue)
@@ -691,9 +695,10 @@ async fn device_output_task<D: OutputDevice + 'static>(
                     ASLEEP.lock().unwrap().remove(&id);
                     log::info!("Standby off for {}", id);
                     match device.set_brightness(screen).await {
+                        // Still dark if OpenDeck has it asleep (screen 0).
                         Ok(()) => match colors_now {
-                            Some(colors) => device.set_led_colors(&colors).await.map(|_| OutputStep::Continue),
-                            None => Ok(OutputStep::Continue),
+                            Some(colors) if screen > 0 => device.set_led_colors(&colors).await.map(|_| OutputStep::Continue),
+                            _ => Ok(OutputStep::Continue),
                         },
                         Err(error) => Err(error),
                     }
@@ -729,6 +734,25 @@ async fn device_output_task<D: OutputDevice + 'static>(
     }
 }
 
+/// OpenDeck sleeps a device (idle timeout, computer locked, `--sleep`) by setting
+/// its brightness to 0, which darkens only the screen. The LEDs follow: a black
+/// frame going to 0, the palette again coming back. Without a palette there is
+/// nothing known to restore, so the LEDs are left alone.
+async fn led_follow_screen<D: OutputDevice + ?Sized>(
+    device: &D,
+    was_dark: bool,
+    brightness: u8,
+    colors: Option<LedPalette>,
+) -> Result<OutputStep, MirajazzError> {
+    let Some(colors) = colors else { return Ok(OutputStep::Continue) };
+    match (was_dark, brightness == 0) {
+        (false, true) => device.set_led_colors(&[[0, 0, 0]; crate::palette::LED_COUNT]).await?,
+        (true, false) => device.set_led_colors(&colors).await?,
+        _ => {}
+    }
+    Ok(OutputStep::Continue)
+}
+
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub fn command_for_set_image(evt: SetImageEvent) -> Result<Option<DeviceCommand>, MirajazzError> {
     match (evt.position, evt.image) {
@@ -747,5 +771,115 @@ pub fn command_for_set_image(evt: SetImageEvent) -> Result<Option<DeviceCommand>
         (Some(position), None) => Ok(Some(DeviceCommand::ClearImage(position))),
         (None, None) => Ok(Some(DeviceCommand::ClearAll)),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the screen and LED writes; everything else is a no-op.
+    #[derive(Default)]
+    struct FakeDevice {
+        writes: Mutex<Vec<String>>,
+    }
+
+    impl FakeDevice {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.writes.lock().unwrap())
+        }
+    }
+
+    impl OutputDevice for FakeDevice {
+        async fn set_button_image(&self, _: u8, _: mirajazz::types::ImageFormat, _: DynamicImage) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn clear_button_image(&self, _: u8) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn clear_all_button_images(&self) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn set_brightness(&self, brightness: u8) -> Result<(), MirajazzError> {
+            self.writes.lock().unwrap().push(format!("screen {brightness}"));
+            Ok(())
+        }
+        async fn set_led_colors(&self, colors: &[[u8; 3]]) -> Result<(), MirajazzError> {
+            let [r, g, b] = colors[0];
+            self.writes.lock().unwrap().push(format!("leds {r:02x}{g:02x}{b:02x}"));
+            Ok(())
+        }
+        async fn set_led_brightness(&self, percent: u8) -> Result<(), MirajazzError> {
+            self.writes.lock().unwrap().push(format!("led level {percent}"));
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn keep_alive(&self) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+    }
+
+    /// Runs the output task on a fake device; returns the command sender.
+    fn start(id: &str) -> (Arc<FakeDevice>, mpsc::Sender<DeviceCommand>, Arc<CancellationToken>) {
+        let device = Arc::new(FakeDevice::default());
+        let (sender, receiver) = mpsc::channel(16);
+        let token = Arc::new(CancellationToken::new());
+        tokio::spawn(device_output_task(id.to_owned(), Kind::VsdInsideM18, device.clone(), receiver, token.clone()));
+        (device, sender, token)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn leds_go_dark_while_opendeck_sleeps_the_screen() {
+        let (device, tx, token) = start("sleep-test");
+        tx.send(DeviceCommand::SetLedColors([[0xff, 0, 0]; crate::palette::LED_COUNT])).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["leds ff0000"]);
+
+        // OpenDeck's sleep: brightness 0. The LEDs go black with the screen.
+        tx.send(DeviceCommand::SetBrightness(0)).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["screen 0", "leds 000000"]);
+
+        // A palette change while asleep is held, not shown.
+        tx.send(DeviceCommand::SetLedColors([[0, 0, 0xff]; crate::palette::LED_COUNT])).await.unwrap();
+        tx.send(DeviceCommand::SetBrightness(0)).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["screen 0"]);
+
+        // Waking: the screen, then the latest palette.
+        tx.send(DeviceCommand::SetBrightness(40)).await.unwrap();
+        tx.send(DeviceCommand::SetBrightness(60)).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["screen 40", "leds 0000ff", "screen 60"]);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn without_a_palette_sleep_leaves_the_leds_alone() {
+        let (device, tx, token) = start("sleep-no-palette");
+        tx.send(DeviceCommand::SetBrightness(0)).await.unwrap();
+        tx.send(DeviceCommand::SetBrightness(50)).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["screen 0", "screen 50"]);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn standby_wake_stays_dark_while_opendeck_has_it_asleep() {
+        let (device, tx, token) = start("standby-test");
+        tx.send(DeviceCommand::SetLedColors([[0, 0xff, 0]; crate::palette::LED_COUNT])).await.unwrap();
+        tx.send(DeviceCommand::Standby(true)).await.unwrap();
+        tx.send(DeviceCommand::SetBrightness(0)).await.unwrap();
+        tx.send(DeviceCommand::Standby(false)).await.unwrap();
+        settle().await;
+        assert_eq!(device.take(), ["leds 00ff00", "leds 000000", "screen 0", "screen 0"]);
+        token.cancel();
     }
 }

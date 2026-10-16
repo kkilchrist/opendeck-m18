@@ -173,9 +173,10 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
 }
 
 /// OpenDeck's brightness, unless the LED socket chose one (fork addition).
+/// 0 always passes: it is how OpenDeck puts a device to sleep.
 fn screen_level(requested: u8) -> u8 {
     match device::SCREEN_LEVEL.load(Ordering::Acquire) {
-        chosen if chosen <= 100 => chosen,
+        chosen if chosen <= 100 && requested > 0 => chosen,
         _ => requested,
     }
 }
